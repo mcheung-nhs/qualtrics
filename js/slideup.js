@@ -7,11 +7,24 @@
      Set to 0 to disable time-triggered display. */
   var displayAfterThisManySeconds = 0;
 
-  var hasAlreadyOpened = false;
+    /* Manual-open policy.
+      'disable-future-auto-open': a manual open prevents later scroll/timer auto-open
+      'ignore-manual-open': a manual open does not affect later auto-open */
+    var manualOpenPolicy = 'disable-future-auto-open';
+
+    /* Automatic trigger policy.
+      'once-per-page': the automatic trigger can only run once per page load
+      'repeatable': the automatic trigger may run again if your logic allows it */
+    var autoOpenPolicy = 'once-per-page';
+
+  var autoTriggerConsumed = false;
+  var isAutoOpening = false;
+  var displayTimerId = null;
   var scrollHandlerAdded = false;
   var lastProcessedScrollEventTime = new Date();
   var liveRegion = null;
   var escapeHandler = null;
+  var surveyObserver = null;
 
   /* Respect the user's operating system preference to reduce motion. */
   var prefersReducedMotion =
@@ -26,6 +39,8 @@
   if (displayAfterUserScrollsPastPercentOfPage) {
     addScrollHandler();
   }
+
+  watchForManualOpen();
 
   /* Creates a visually-hidden aria-live region used to announce state
      changes to screen readers without moving visible focus. */
@@ -52,19 +67,84 @@
     }, 50);
   }
 
-  function openButton() {
-    if (hasAlreadyOpened) return;
-    hasAlreadyOpened = true;
+  function shouldConsumeTriggerOnManualOpen() {
+    return manualOpenPolicy === 'disable-future-auto-open';
+  }
 
-    /* Stop listening for scroll events now that the survey will open. */
+  function shouldConsumeTriggerOnAutoOpen() {
+    return autoOpenPolicy === 'once-per-page';
+  }
+
+  function stopAutoTriggers() {
+    if (displayTimerId) {
+      clearTimeout(displayTimerId);
+      displayTimerId = null;
+    }
+
     if (scrollHandlerAdded) {
       window.removeEventListener('scroll', onScroll, { passive: true });
       scrollHandlerAdded = false;
     }
+  }
+
+  function consumeAutoTrigger() {
+    if (autoTriggerConsumed) return;
+    autoTriggerConsumed = true;
+    stopAutoTriggers();
+  }
+
+  function getSurveyFrame() {
+    return (
+      document.querySelector('.QSIFeedbackButton iframe') ||
+      document.querySelector('#ZN_eaDVkKUnDpnwcei iframe')
+    );
+  }
+
+  function watchForManualOpen() {
+    document.addEventListener(
+      'click',
+      function (event) {
+        var launcher = event.target.closest('.QSIFeedbackButton button');
+        if (launcher && !isAutoOpening && shouldConsumeTriggerOnManualOpen()) {
+          consumeAutoTrigger();
+        }
+      },
+      true
+    );
+
+    if (!window.MutationObserver) return;
+
+    surveyObserver = new MutationObserver(function () {
+      if (
+        isAutoOpening ||
+        autoTriggerConsumed ||
+        !shouldConsumeTriggerOnManualOpen()
+      ) {
+        return;
+      }
+
+      if (getSurveyFrame()) {
+        consumeAutoTrigger();
+      }
+    });
+
+    surveyObserver.observe(document.body, {
+      childList: true,
+      subtree: true,
+    });
+  }
+
+  function openButton() {
+    if (autoTriggerConsumed) return;
 
     try {
       var button = document.querySelector('.QSIFeedbackButton button');
       if (!button) return;
+
+      if (shouldConsumeTriggerOnAutoOpen()) {
+        consumeAutoTrigger();
+      }
+      isAutoOpening = true;
 
       /* Remember where focus was before we intervene, so we can restore it
          when the user closes the survey. */
@@ -93,12 +173,11 @@
         var pollForFrame = setInterval(function () {
           pollAttempts++;
 
-          var surveyFrame =
-            document.querySelector('.QSIFeedbackButton iframe') ||
-            document.querySelector('#ZN_eaDVkKUnDpnwcei iframe');
+          var surveyFrame = getSurveyFrame();
 
           if (surveyFrame || pollAttempts >= maxAttempts) {
             clearInterval(pollForFrame);
+            isAutoOpening = false;
 
             if (surveyFrame) {
               /* Ensure the iframe has a label so screen readers announce
@@ -158,7 +237,10 @@
   }
 
   function addTimer() {
-    setTimeout(openButton, displayAfterThisManySeconds * 1000);
+    displayTimerId = setTimeout(function () {
+      displayTimerId = null;
+      openButton();
+    }, displayAfterThisManySeconds * 1000);
   }
 
   function onScroll() {
