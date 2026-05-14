@@ -25,6 +25,12 @@
      'repeatable': the automatic trigger may run again if your logic allows it */
   var autoOpenPolicy = 'once-per-page';
 
+  /* On touch/mobile devices the Qualtrics feedback button may navigate to
+     a full-page survey URL rather than opening an in-page panel. Skip the
+     programmatic open click on those devices and rely on Qualtrics' own
+     trigger or user interaction instead. */
+  var isTouchDevice = ('ontouchstart' in window) || (navigator.maxTouchPoints > 0);
+
   var autoTriggerConsumed = false;
   var isAutoOpening = false;
   var isSurveyOpen = false;
@@ -364,7 +370,11 @@
           return;
         }
 
-        clickLauncherSafely(button);
+        /* On touch devices skip the programmatic click — Qualtrics handles
+           its own trigger on mobile and a scripted click may navigate away. */
+        if (!isTouchDevice) {
+          clickLauncherSafely(button);
+        }
 
         /* Poll for the survey iframe, then focus it. Qualtrics renders survey
            content inside a cross-origin iframe; focusing the iframe element
