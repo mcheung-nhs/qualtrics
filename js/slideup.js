@@ -13,7 +13,7 @@
   var displayAfterThisManySeconds = 0;
 
   /* Set to true while testing to log survey state transitions. */
-  var debugSurveyState = false;
+  var debugSurveyState = true;
 
   /* Manual-open policy.
      'disable-future-auto-open': a manual open prevents later scroll/timer auto-open
@@ -37,8 +37,6 @@
   var lastFocusBeforeSurveyOpen = null;
   var lastSurveyOpenedAt = 0;
   var closeConfirmTimerId = null;
-  var launcherProgrammaticClickCooldownUntil = 0;
-  var allowNextProgrammaticLauncherClick = false;
 
   /* Respect the user's operating system preference to reduce motion. */
   var prefersReducedMotion =
@@ -167,40 +165,6 @@
     }, 300);
   }
 
-  function armLauncherProgrammaticClickGuard(button) {
-    if (!button || button.__slideupClickGuardArmed) return;
-
-    var originalClick = button.click;
-    button.click = function () {
-      if (
-        Date.now() < launcherProgrammaticClickCooldownUntil &&
-        !allowNextProgrammaticLauncherClick
-      ) {
-        debugLog('Blocked launcher .click() during cooldown.', {
-          msRemaining: launcherProgrammaticClickCooldownUntil - Date.now(),
-        });
-        return;
-      }
-
-      allowNextProgrammaticLauncherClick = false;
-      return originalClick.apply(button, arguments);
-    };
-
-    button.__slideupClickGuardArmed = true;
-  }
-
-  function safeProgrammaticLauncherClick(button, reason, cooldownMs) {
-    armLauncherProgrammaticClickGuard(button);
-    allowNextProgrammaticLauncherClick = true;
-    button.click();
-    launcherProgrammaticClickCooldownUntil =
-      Date.now() + Math.max(0, cooldownMs || 0);
-    debugLog('Programmatic launcher click issued.', {
-      reason: reason,
-      cooldownUntil: launcherProgrammaticClickCooldownUntil,
-    });
-  }
-
   function stopAutoTriggers() {
     if (displayTimerId) {
       clearTimeout(displayTimerId);
@@ -271,6 +235,13 @@
       'click',
       function (event) {
         var launcher = event.target.closest('.QSIFeedbackButton button');
+        var launcherLink = event.target.closest('.QSIFeedbackButton a[href="#"]');
+
+        if (launcherLink) {
+          /* Prevent hash navigation (jump to top) when VoiceOver activates
+             launcher markup wrapped in href="#" links on iOS Safari. */
+          event.preventDefault();
+        }
 
         if (launcher && !isSurveyOpen && !isAutoOpening) {
           rememberFocusBeforeOpen();
@@ -342,8 +313,6 @@
         return;
       }
 
-      armLauncherProgrammaticClickGuard(button);
-
       if (shouldConsumeTriggerOnAutoOpen()) {
         consumeAutoTrigger();
       }
@@ -367,7 +336,7 @@
           return;
         }
 
-        safeProgrammaticLauncherClick(button, 'auto-open', 2500);
+        button.click();
 
         /* Poll for the survey iframe, then focus it. Qualtrics renders survey
            content inside a cross-origin iframe; focusing the iframe element
@@ -431,7 +400,7 @@
           document.removeEventListener('keydown', escapeHandler);
           escapeHandler = null;
 
-          safeProgrammaticLauncherClick(button, 'escape-close', 0); /* Close the panel. */
+          button.click(); /* Close the panel. */
           isSurveyOpen = false;
           lastSurveyOpenedAt = 0;
           if (closeConfirmTimerId) {
