@@ -165,6 +165,34 @@
     }, 300);
   }
 
+  /* Safely click the Qualtrics launcher button without triggering form
+     submission or anchor navigation, both of which reload the page on
+     iOS Safari. */
+  function clickLauncherSafely(button) {
+    var handlers = [];
+
+    var form = button.closest('form');
+    if (form) {
+      var preventSubmit = function (e) { e.preventDefault(); };
+      form.addEventListener('submit', preventSubmit, true);
+      handlers.push(function () { form.removeEventListener('submit', preventSubmit, true); });
+    }
+
+    var anchor = button.closest('a[href]');
+    if (anchor) {
+      var preventNav = function (e) { e.preventDefault(); };
+      anchor.addEventListener('click', preventNav, true);
+      handlers.push(function () { anchor.removeEventListener('click', preventNav, true); });
+    }
+
+    button.click();
+
+    /* Remove the temporary guards after the event has propagated. */
+    setTimeout(function () {
+      for (var i = 0; i < handlers.length; i++) { handlers[i](); }
+    }, 0);
+  }
+
   function stopAutoTriggers() {
     if (displayTimerId) {
       clearTimeout(displayTimerId);
@@ -336,7 +364,7 @@
           return;
         }
 
-        button.click();
+        clickLauncherSafely(button);
 
         /* Poll for the survey iframe, then focus it. Qualtrics renders survey
            content inside a cross-origin iframe; focusing the iframe element
@@ -400,7 +428,7 @@
           document.removeEventListener('keydown', escapeHandler);
           escapeHandler = null;
 
-          button.click(); /* Close the panel. */
+          clickLauncherSafely(button); /* Close the panel. */
           isSurveyOpen = false;
           lastSurveyOpenedAt = 0;
           if (closeConfirmTimerId) {
