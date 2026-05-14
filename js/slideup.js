@@ -60,6 +60,12 @@
 
   watchForManualOpen();
 
+    /* Create the aria-live region immediately so it already exists in the DOM
+      before Qualtrics sets up its own MutationObserver. Adding a new body
+      child mid-flow triggers Qualtrics' observer on iOS and causes unexpected
+      navigation/page reload on mobile. */
+    getOrCreateLiveRegion();
+
   /* Creates a visually-hidden aria-live region used to announce state
      changes to screen readers without moving visible focus. */
   function getOrCreateLiveRegion() {
@@ -354,9 +360,12 @@
       debugLog('Starting auto-open flow.');
       rememberFocusBeforeOpen();
 
-      /* Announce to screen readers before opening so they hear the message
-         before focus shifts. */
-      announce('A short feedback survey is now available.');
+      /* Pre-announce on desktop screen readers only. Skip on touch devices:
+        VoiceOver on iOS reads the survey when it opens, and any further DOM
+        mutation here can trigger Qualtrics' own observer on mobile. */
+      if (!isTouchDevice) {
+        announce('A short feedback survey is now available.');
+      }
 
       /* A brief delay lets the aria-live announcement be read first.
          Reduced for users who prefer less motion/animation. */
