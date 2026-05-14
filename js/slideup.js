@@ -7,6 +7,9 @@
      Set to 0 to disable time-triggered display. */
   var displayAfterThisManySeconds = 0;
 
+    /* Set to true while testing to log survey state transitions. */
+    var debugSurveyState = true;
+
     /* Manual-open policy.
       'disable-future-auto-open': a manual open prevents later scroll/timer auto-open
       'ignore-manual-open': a manual open does not affect later auto-open */
@@ -19,12 +22,14 @@
 
   var autoTriggerConsumed = false;
   var isAutoOpening = false;
+  var isSurveyOpen = false;
   var displayTimerId = null;
   var scrollHandlerAdded = false;
   var lastProcessedScrollEventTime = new Date();
   var liveRegion = null;
   var escapeHandler = null;
   var surveyObserver = null;
+  var lastFocusBeforeSurveyOpen = null;
 
   /* Respect the user's operating system preference to reduce motion. */
   var prefersReducedMotion =
@@ -75,6 +80,57 @@
     return autoOpenPolicy === 'once-per-page';
   }
 
+  function debugLog(message, metadata) {
+    if (!debugSurveyState || !window.console || !console.log) return;
+    if (metadata) {
+      console.log('[slideup]', message, metadata);
+    } else {
+      console.log('[slideup]', message);
+    }
+  }
+
+  function rememberFocusBeforeOpen() {
+    lastFocusBeforeSurveyOpen = document.activeElement;
+    debugLog('Remembered focus before survey open.', {
+      tagName:
+        lastFocusBeforeSurveyOpen && lastFocusBeforeSurveyOpen.tagName
+          ? lastFocusBeforeSurveyOpen.tagName
+          : null,
+    });
+  }
+
+  function isUsableFocusTarget(element) {
+    return (
+      !!element &&
+      element !== document.body &&
+      element !== document.documentElement &&
+      typeof element.focus === 'function' &&
+      document.contains(element)
+    );
+  }
+
+  function restoreFocusAfterClose() {
+    var restoreTarget = isUsableFocusTarget(lastFocusBeforeSurveyOpen)
+      ? lastFocusBeforeSurveyOpen
+      : document.querySelector('.QSIFeedbackButton button');
+
+    lastFocusBeforeSurveyOpen = null;
+
+    if (!restoreTarget || typeof restoreTarget.focus !== 'function') {
+      debugLog('No valid element available for focus restore.');
+      return;
+    }
+
+    setTimeout(function () {
+      try {
+        restoreTarget.focus({ preventScroll: true });
+      } catch (e) {
+        restoreTarget.focus();
+      }
+      debugLog('Focus restored after survey close.');
+    }, 100);
+  }
+
   function stopAutoTriggers() {
     if (displayTimerId) {
       clearTimeout(displayTimerId);
@@ -90,6 +146,7 @@
   function consumeAutoTrigger() {
     if (autoTriggerConsumed) return;
     autoTriggerConsumed = true;
+    debugLog('Auto trigger consumed.');
     stopAutoTriggers();
   }
 
@@ -100,11 +157,46 @@
     );
   }
 
+  /* Best-effort visibility check so we can mirror Qualtrics open/close
+     state even when users close via Qualtrics UI controls. */
+  function isElementVisible(element) {
+    if (!element || !window.getComputedStyle) return false;
+    var style = window.getComputedStyle(element);
+    if (
+      style.display === 'none' ||
+      style.visibility === 'hidden' ||
+      style.opacity === '0'
+    ) {
+      return false;
+    }
+
+    var rect = element.getBoundingClientRect();
+    return rect.width > 0 && rect.height > 0;
+  }
+
+  function isSurveyCurrentlyOpen() {
+    var surveyFrame = getSurveyFrame();
+    if (!surveyFrame) return false;
+
+    if (isElementVisible(surveyFrame)) return true;
+
+    var panel = surveyFrame.closest(
+      '.QSIWebResponsiveDialog-Layout1-SI_Container, .QSIPopOver, .QSIContainer, #ZN_eaDVkKUnDpnwcei'
+    );
+
+    return isElementVisible(panel);
+  }
+
   function watchForManualOpen() {
     document.addEventListener(
       'click',
       function (event) {
         var launcher = event.target.closest('.QSIFeedbackButton button');
+
+        if (launcher && !isSurveyOpen && !isAutoOpening) {
+          rememberFocusBeforeOpen();
+        }
+
         if (launcher && !isAutoOpening && shouldConsumeTriggerOnManualOpen()) {
           consumeAutoTrigger();
         }
@@ -115,6 +207,19 @@
     if (!window.MutationObserver) return;
 
     surveyObserver = new MutationObserver(function () {
+      var surveyIsOpenNow = isSurveyCurrentlyOpen();
+
+      if (!isAutoOpening) {
+        if (!isSurveyOpen && surveyIsOpenNow) {
+          isSurveyOpen = true;
+          debugLog('Survey marked open from observer.');
+        } else if (isSurveyOpen && !surveyIsOpenNow) {
+          isSurveyOpen = false;
+          debugLog('Survey marked closed from observer.');
+          restoreFocusAfterClose();
+        }
+      }
+
       if (
         isAutoOpening ||
         autoTriggerConsumed ||
@@ -131,24 +236,34 @@
     surveyObserver.observe(document.body, {
       childList: true,
       subtree: true,
+      attributes: true,
+      attributeFilter: ['class', 'style', 'hidden', 'aria-hidden'],
     });
   }
 
   function openButton() {
-    if (autoTriggerConsumed) return;
+    if (autoTriggerConsumed || isAutoOpening || isSurveyOpen) {
+      debugLog('Auto-open skipped.', {
+        autoTriggerConsumed: autoTriggerConsumed,
+        isAutoOpening: isAutoOpening,
+        isSurveyOpen: isSurveyOpen,
+      });
+      return;
+    }
 
     try {
       var button = document.querySelector('.QSIFeedbackButton button');
-      if (!button) return;
+      if (!button) {
+        debugLog('Auto-open skipped: launcher button not found.');
+        return;
+      }
 
       if (shouldConsumeTriggerOnAutoOpen()) {
         consumeAutoTrigger();
       }
       isAutoOpening = true;
-
-      /* Remember where focus was before we intervene, so we can restore it
-         when the user closes the survey. */
-      var previouslyFocused = document.activeElement;
+      debugLog('Starting auto-open flow.');
+      rememberFocusBeforeOpen();
 
       /* Announce to screen readers before opening so they hear the message
          before focus shifts. */
@@ -180,6 +295,8 @@
             isAutoOpening = false;
 
             if (surveyFrame) {
+              isSurveyOpen = true;
+              debugLog('Survey iframe detected and marked open.');
               /* Ensure the iframe has a label so screen readers announce
                  what it contains when focus enters it. */
               if (!surveyFrame.getAttribute('title')) {
@@ -193,6 +310,7 @@
               surveyFrame.focus();
             } else {
               /* iframe never appeared — fall back to the toggle button. */
+              debugLog('Survey iframe not detected before timeout.');
               button.focus();
             }
 
@@ -209,14 +327,10 @@
           escapeHandler = null;
 
           button.click(); /* Close the panel. */
+          isSurveyOpen = false;
+          debugLog('Survey closed via Escape key.');
           announce('Feedback survey closed.');
-
-          /* Return focus to wherever the user was before the survey opened. */
-          setTimeout(function () {
-            if (previouslyFocused && typeof previouslyFocused.focus === 'function') {
-              previouslyFocused.focus();
-            }
-          }, 100);
+          restoreFocusAfterClose();
         };
 
         document.addEventListener('keydown', escapeHandler);
@@ -255,6 +369,10 @@
         var currentScrollPercentage = (window.scrollY / docHeight) * 100;
 
         if (currentScrollPercentage >= displayAfterUserScrollsPastPercentOfPage) {
+          debugLog('Scroll threshold reached.', {
+            currentScrollPercentage: currentScrollPercentage,
+            threshold: displayAfterUserScrollsPastPercentOfPage,
+          });
           openButton();
         }
       } catch (e) {
