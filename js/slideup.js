@@ -1,4 +1,9 @@
 (function () {
+  if (window.__qualtricsSlideupInitDone) {
+    return;
+  }
+  window.__qualtricsSlideupInitDone = true;
+
   /* Scroll depth (%) after which the survey is shown automatically.
      Set to 0 to disable scroll-triggered display. */
   var displayAfterUserScrollsPastPercentOfPage = 20;
@@ -7,18 +12,18 @@
      Set to 0 to disable time-triggered display. */
   var displayAfterThisManySeconds = 0;
 
-    /* Set to true while testing to log survey state transitions. */
-    var debugSurveyState = true;
+  /* Set to true while testing to log survey state transitions. */
+  var debugSurveyState = false;
 
-    /* Manual-open policy.
-      'disable-future-auto-open': a manual open prevents later scroll/timer auto-open
-      'ignore-manual-open': a manual open does not affect later auto-open */
-    var manualOpenPolicy = 'disable-future-auto-open';
+  /* Manual-open policy.
+     'disable-future-auto-open': a manual open prevents later scroll/timer auto-open
+     'ignore-manual-open': a manual open does not affect later auto-open */
+  var manualOpenPolicy = 'disable-future-auto-open';
 
-    /* Automatic trigger policy.
-      'once-per-page': the automatic trigger can only run once per page load
-      'repeatable': the automatic trigger may run again if your logic allows it */
-    var autoOpenPolicy = 'once-per-page';
+  /* Automatic trigger policy.
+     'once-per-page': the automatic trigger can only run once per page load
+     'repeatable': the automatic trigger may run again if your logic allows it */
+  var autoOpenPolicy = 'once-per-page';
 
   var autoTriggerConsumed = false;
   var isAutoOpening = false;
@@ -30,6 +35,10 @@
   var escapeHandler = null;
   var surveyObserver = null;
   var lastFocusBeforeSurveyOpen = null;
+  var lastSurveyOpenedAt = 0;
+  var closeConfirmTimerId = null;
+  var launcherProgrammaticClickCooldownUntil = 0;
+  var allowNextProgrammaticLauncherClick = false;
 
   /* Respect the user's operating system preference to reduce motion. */
   var prefersReducedMotion =
@@ -131,6 +140,67 @@
     }, 100);
   }
 
+  function markSurveyOpened() {
+    lastSurveyOpenedAt = Date.now();
+    if (closeConfirmTimerId) {
+      clearTimeout(closeConfirmTimerId);
+      closeConfirmTimerId = null;
+    }
+  }
+
+  function scheduleConfirmedCloseHandling() {
+    if (closeConfirmTimerId) return;
+
+    closeConfirmTimerId = setTimeout(function () {
+      closeConfirmTimerId = null;
+
+      /* During desktop animation/layout transitions Qualtrics may briefly
+         report a closed-like state; only act when it remains closed. */
+      if (isSurveyCurrentlyOpen()) {
+        debugLog('Ignoring transient close state; survey is still open.');
+        return;
+      }
+
+      isSurveyOpen = false;
+      debugLog('Survey close confirmed after debounce.');
+      restoreFocusAfterClose();
+    }, 300);
+  }
+
+  function armLauncherProgrammaticClickGuard(button) {
+    if (!button || button.__slideupClickGuardArmed) return;
+
+    var originalClick = button.click;
+    button.click = function () {
+      if (
+        Date.now() < launcherProgrammaticClickCooldownUntil &&
+        !allowNextProgrammaticLauncherClick
+      ) {
+        debugLog('Blocked launcher .click() during cooldown.', {
+          msRemaining: launcherProgrammaticClickCooldownUntil - Date.now(),
+        });
+        return;
+      }
+
+      allowNextProgrammaticLauncherClick = false;
+      return originalClick.apply(button, arguments);
+    };
+
+    button.__slideupClickGuardArmed = true;
+  }
+
+  function safeProgrammaticLauncherClick(button, reason, cooldownMs) {
+    armLauncherProgrammaticClickGuard(button);
+    allowNextProgrammaticLauncherClick = true;
+    button.click();
+    launcherProgrammaticClickCooldownUntil =
+      Date.now() + Math.max(0, cooldownMs || 0);
+    debugLog('Programmatic launcher click issued.', {
+      reason: reason,
+      cooldownUntil: launcherProgrammaticClickCooldownUntil,
+    });
+  }
+
   function stopAutoTriggers() {
     if (displayTimerId) {
       clearTimeout(displayTimerId);
@@ -174,17 +244,26 @@
     return rect.width > 0 && rect.height > 0;
   }
 
+  function isElementA11yVisible(element) {
+    return (
+      !!element &&
+      !element.closest('[aria-hidden="true"], [hidden], [inert]')
+    );
+  }
+
   function isSurveyCurrentlyOpen() {
     var surveyFrame = getSurveyFrame();
     if (!surveyFrame) return false;
 
-    if (isElementVisible(surveyFrame)) return true;
-
     var panel = surveyFrame.closest(
-      '.QSIWebResponsiveDialog-Layout1-SI_Container, .QSIPopOver, .QSIContainer, #ZN_eaDVkKUnDpnwcei'
+      '.QSIWebResponsiveDialog-Layout1-SI_Container, .QSIPopOver, .QSIContainer, #ZN_eaDVkKUnDpnwcei, #QSIFeedbackButton-target-container'
     );
 
-    return isElementVisible(panel);
+    if (isElementVisible(surveyFrame) && (!panel || isElementVisible(panel))) {
+      return true;
+    }
+
+    return false;
   }
 
   function watchForManualOpen() {
@@ -209,15 +288,20 @@
     surveyObserver = new MutationObserver(function () {
       var surveyIsOpenNow = isSurveyCurrentlyOpen();
 
-      if (!isAutoOpening) {
-        if (!isSurveyOpen && surveyIsOpenNow) {
-          isSurveyOpen = true;
-          debugLog('Survey marked open from observer.');
-        } else if (isSurveyOpen && !surveyIsOpenNow) {
-          isSurveyOpen = false;
-          debugLog('Survey marked closed from observer.');
-          restoreFocusAfterClose();
+      if (!isSurveyOpen && surveyIsOpenNow) {
+        isSurveyOpen = true;
+        markSurveyOpened();
+        debugLog('Survey marked open from observer.');
+      } else if (isSurveyOpen && !surveyIsOpenNow) {
+        if (Date.now() - lastSurveyOpenedAt < 1000) {
+          debugLog('Ignoring immediate post-open close signal.', {
+            msSinceOpen: Date.now() - lastSurveyOpenedAt,
+          });
+          return;
         }
+
+        debugLog('Potential survey close detected; waiting to confirm.');
+        scheduleConfirmedCloseHandling();
       }
 
       if (
@@ -258,6 +342,8 @@
         return;
       }
 
+      armLauncherProgrammaticClickGuard(button);
+
       if (shouldConsumeTriggerOnAutoOpen()) {
         consumeAutoTrigger();
       }
@@ -274,7 +360,14 @@
       var openDelay = prefersReducedMotion ? 0 : 300;
 
       setTimeout(function () {
-        button.click();
+        if (isSurveyOpen || isSurveyCurrentlyOpen()) {
+          isAutoOpening = false;
+          markSurveyOpened();
+          debugLog('Skipping auto-open click: survey already open before click.');
+          return;
+        }
+
+        safeProgrammaticLauncherClick(button, 'auto-open', 2500);
 
         /* Poll for the survey iframe, then focus it. Qualtrics renders survey
            content inside a cross-origin iframe; focusing the iframe element
@@ -282,20 +375,28 @@
            We poll rather than use a fixed delay because the iframe may take
            a variable amount of time to be injected into the DOM. */
         var pollAttempts = 0;
-        var maxAttempts = prefersReducedMotion ? 5 : 20;
+        var stableOpenPolls = 0;
+        var maxAttempts = prefersReducedMotion ? 8 : 40;
         var pollInterval = prefersReducedMotion ? 50 : 100;
 
         var pollForFrame = setInterval(function () {
           pollAttempts++;
 
           var surveyFrame = getSurveyFrame();
+          var surveyIsOpenNow = isSurveyCurrentlyOpen();
+          if (surveyIsOpenNow) {
+            stableOpenPolls++;
+          } else {
+            stableOpenPolls = 0;
+          }
 
-          if (surveyFrame || pollAttempts >= maxAttempts) {
+          if (stableOpenPolls >= 2 || pollAttempts >= maxAttempts) {
             clearInterval(pollForFrame);
             isAutoOpening = false;
 
-            if (surveyFrame) {
+            if (stableOpenPolls >= 2 && surveyFrame) {
               isSurveyOpen = true;
+              markSurveyOpened();
               debugLog('Survey iframe detected and marked open.');
               /* Ensure the iframe has a label so screen readers announce
                  what it contains when focus enters it. */
@@ -307,14 +408,18 @@
               if (!surveyFrame.hasAttribute('tabindex')) {
                 surveyFrame.setAttribute('tabindex', '-1');
               }
-              surveyFrame.focus();
+              if (isElementA11yVisible(surveyFrame)) {
+                surveyFrame.focus();
+              } else {
+                debugLog('Skipping iframe focus until it is accessibility-visible.');
+              }
+
+              announce('Feedback survey opened. Press Escape to close.');
             } else {
-              /* iframe never appeared — fall back to the toggle button. */
-              debugLog('Survey iframe not detected before timeout.');
+              /* Survey never reached a confirmed visible/open state. */
+              debugLog('Survey did not reach a confirmed open state before timeout.');
               button.focus();
             }
-
-            announce('Feedback survey opened. Press Escape to close.');
           }
         }, pollInterval);
 
@@ -326,8 +431,13 @@
           document.removeEventListener('keydown', escapeHandler);
           escapeHandler = null;
 
-          button.click(); /* Close the panel. */
+          safeProgrammaticLauncherClick(button, 'escape-close', 0); /* Close the panel. */
           isSurveyOpen = false;
+          lastSurveyOpenedAt = 0;
+          if (closeConfirmTimerId) {
+            clearTimeout(closeConfirmTimerId);
+            closeConfirmTimerId = null;
+          }
           debugLog('Survey closed via Escape key.');
           announce('Feedback survey closed.');
           restoreFocusAfterClose();
