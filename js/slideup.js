@@ -1,509 +1,608 @@
 (function () {
-  if (window.__qualtricsSlideupInitDone) {
-    return;
-  }
-  window.__qualtricsSlideupInitDone = true;
-
-  /* Scroll depth (%) after which the survey is shown automatically.
-     Set to 0 to disable scroll-triggered display. */
-  var displayAfterUserScrollsPastPercentOfPage = 20;
-
-  /* Seconds after page load before showing the survey.
-     Set to 0 to disable time-triggered display. */
-  var displayAfterThisManySeconds = 0;
-
-  /* Set to true while testing to log survey state transitions. */
-  var debugSurveyState = true;
-
-  /* Manual-open policy.
-     'disable-future-auto-open': a manual open prevents later scroll/timer auto-open
-     'ignore-manual-open': a manual open does not affect later auto-open */
-  var manualOpenPolicy = 'disable-future-auto-open';
-
-  /* Automatic trigger policy.
-     'once-per-page': the automatic trigger can only run once per page load
-     'repeatable': the automatic trigger may run again if your logic allows it */
-  var autoOpenPolicy = 'once-per-page';
-
-  /* On touch/mobile devices the Qualtrics feedback button may navigate to
-     a full-page survey URL rather than opening an in-page panel. Skip the
-     programmatic open click on those devices and rely on Qualtrics' own
-     trigger or user interaction instead. */
-  var isTouchDevice = ('ontouchstart' in window) || (navigator.maxTouchPoints > 0);
-
-  var autoTriggerConsumed = false;
-  var isAutoOpening = false;
-  var isSurveyOpen = false;
-  var displayTimerId = null;
-  var scrollHandlerAdded = false;
-  var lastProcessedScrollEventTime = new Date();
-  var liveRegion = null;
-  var escapeHandler = null;
-  var surveyObserver = null;
-  var lastFocusBeforeSurveyOpen = null;
-  var lastSurveyOpenedAt = 0;
-  var closeConfirmTimerId = null;
-
-  /* Respect the user's operating system preference to reduce motion. */
-  var prefersReducedMotion =
-    window.matchMedia
-      ? window.matchMedia('(prefers-reduced-motion: reduce)').matches
-      : false;
-
-  if (displayAfterThisManySeconds) {
-    addTimer();
-  }
-
-  if (displayAfterUserScrollsPastPercentOfPage) {
-    addScrollHandler();
-  }
-
-  watchForManualOpen();
-
-    /* Create the aria-live region immediately so it already exists in the DOM
-      before Qualtrics sets up its own MutationObserver. Adding a new body
-      child mid-flow triggers Qualtrics' observer on iOS and causes unexpected
-      navigation/page reload on mobile. */
-    getOrCreateLiveRegion();
-
-  /* Creates a visually-hidden aria-live region used to announce state
-     changes to screen readers without moving visible focus. */
-  function getOrCreateLiveRegion() {
-    if (liveRegion) return liveRegion;
-    liveRegion = document.createElement('div');
-    liveRegion.setAttribute('role', 'status');
-    liveRegion.setAttribute('aria-live', 'polite');
-    liveRegion.setAttribute('aria-atomic', 'true');
-    liveRegion.style.cssText =
-      'position:absolute;width:1px;height:1px;overflow:hidden;' +
-      'clip:rect(0,0,0,0);white-space:nowrap;border:0;';
-    document.body.appendChild(liveRegion);
-    return liveRegion;
-  }
-
-  /* Sends a polite announcement to screen readers. Clears first to ensure
-     repeated identical messages are still surfaced. */
-  function announce(message) {
-    var region = getOrCreateLiveRegion();
-    region.textContent = '';
-    setTimeout(function () {
-      region.textContent = message;
-    }, 50);
-  }
-
-  function shouldConsumeTriggerOnManualOpen() {
-    return manualOpenPolicy === 'disable-future-auto-open';
-  }
-
-  function shouldConsumeTriggerOnAutoOpen() {
-    return autoOpenPolicy === 'once-per-page';
-  }
-
-  function debugLog(message, metadata) {
-    if (!debugSurveyState || !window.console || !console.log) return;
-    if (metadata) {
-      console.log('[slideup]', message, metadata);
-    } else {
-      console.log('[slideup]', message);
-    }
-  }
-
-  function rememberFocusBeforeOpen() {
-    lastFocusBeforeSurveyOpen = document.activeElement;
-    debugLog('Remembered focus before survey open.', {
-      tagName:
-        lastFocusBeforeSurveyOpen && lastFocusBeforeSurveyOpen.tagName
-          ? lastFocusBeforeSurveyOpen.tagName
-          : null,
-    });
-  }
-
-  function isUsableFocusTarget(element) {
-    return (
-      !!element &&
-      element !== document.body &&
-      element !== document.documentElement &&
-      typeof element.focus === 'function' &&
-      document.contains(element)
-    );
-  }
-
-  function restoreFocusAfterClose() {
-    var restoreTarget = isUsableFocusTarget(lastFocusBeforeSurveyOpen)
-      ? lastFocusBeforeSurveyOpen
-      : document.querySelector('.QSIFeedbackButton button');
-
-    lastFocusBeforeSurveyOpen = null;
-
-    if (!restoreTarget || typeof restoreTarget.focus !== 'function') {
-      debugLog('No valid element available for focus restore.');
-      return;
-    }
-
-    setTimeout(function () {
-      try {
-        restoreTarget.focus({ preventScroll: true });
-      } catch (e) {
-        restoreTarget.focus();
-      }
-      debugLog('Focus restored after survey close.');
-    }, 100);
-  }
-
-  function markSurveyOpened() {
-    lastSurveyOpenedAt = Date.now();
-    if (closeConfirmTimerId) {
-      clearTimeout(closeConfirmTimerId);
-      closeConfirmTimerId = null;
-    }
-  }
-
-  function scheduleConfirmedCloseHandling() {
-    if (closeConfirmTimerId) return;
-
-    closeConfirmTimerId = setTimeout(function () {
-      closeConfirmTimerId = null;
-
-      /* During desktop animation/layout transitions Qualtrics may briefly
-         report a closed-like state; only act when it remains closed. */
-      if (isSurveyCurrentlyOpen()) {
-        debugLog('Ignoring transient close state; survey is still open.');
+    if (window.__qualtricsSlideupInitDone) {
         return;
-      }
+    }
+    window.__qualtricsSlideupInitDone = true;
 
-      isSurveyOpen = false;
-      debugLog('Survey close confirmed after debounce.');
-      restoreFocusAfterClose();
-    }, 300);
-  }
+    var displayAfterUserScrollsPastPercentOfPage = 20;
+    var displayAfterThisManySeconds = 0;
+    var scrollThrottleMs = 120;
 
-  /* Safely click the Qualtrics launcher button without triggering form
-     submission or anchor navigation, both of which reload the page on
-     iOS Safari. */
-  function clickLauncherSafely(button) {
-    var handlers = [];
+    var autoTriggerConsumed = false;
+    var isAutoOpening = false;
+    var isSurveyOpen = false;
+    var displayTimerId = null;
+    var scrollHandlerAdded = false;
+    var lastProcessedScrollEventTime = 0;
+    var lastFocusBeforeSurveyOpen = null;
+    var lastUserContextElement = null;
+    var liveRegion = null;
+    var openAnnouncementSent = false;
+    var openingAnnouncementSent = false;
 
-    var form = button.closest('form');
-    if (form) {
-      var preventSubmit = function (e) { e.preventDefault(); };
-      form.addEventListener('submit', preventSubmit, true);
-      handlers.push(function () { form.removeEventListener('submit', preventSubmit, true); });
+    createLiveRegion();
+    watchForManualOpenAndStateChanges();
+
+    if (displayAfterThisManySeconds > 0) {
+        addTimer();
     }
 
-    var anchor = button.closest('a[href]');
-    if (anchor) {
-      var preventNav = function (e) { e.preventDefault(); };
-      anchor.addEventListener('click', preventNav, true);
-      handlers.push(function () { anchor.removeEventListener('click', preventNav, true); });
+    if (displayAfterUserScrollsPastPercentOfPage > 0) {
+        addScrollHandler();
     }
 
-    button.click();
+    function createLiveRegion() {
+        if (liveRegion) return liveRegion;
 
-    /* Remove the temporary guards after the event has propagated. */
-    setTimeout(function () {
-      for (var i = 0; i < handlers.length; i++) { handlers[i](); }
-    }, 0);
-  }
+        liveRegion = document.createElement('div');
+        liveRegion.setAttribute('role', 'status');
+        liveRegion.setAttribute('aria-live', 'polite');
+        liveRegion.setAttribute('aria-atomic', 'true');
+        liveRegion.style.cssText =
+            'position:absolute;width:1px;height:1px;overflow:hidden;' +
+            'clip:rect(0,0,0,0);white-space:nowrap;border:0;';
 
-  function stopAutoTriggers() {
-    if (displayTimerId) {
-      clearTimeout(displayTimerId);
-      displayTimerId = null;
+        document.body.appendChild(liveRegion);
+        return liveRegion;
     }
 
-    if (scrollHandlerAdded) {
-      window.removeEventListener('scroll', onScroll, { passive: true });
-      scrollHandlerAdded = false;
-    }
-  }
-
-  function consumeAutoTrigger() {
-    if (autoTriggerConsumed) return;
-    autoTriggerConsumed = true;
-    debugLog('Auto trigger consumed.');
-    stopAutoTriggers();
-  }
-
-  function getSurveyFrame() {
-    return (
-      document.querySelector('.QSIFeedbackButton iframe') ||
-      document.querySelector('#ZN_eaDVkKUnDpnwcei iframe')
-    );
-  }
-
-  /* Best-effort visibility check so we can mirror Qualtrics open/close
-     state even when users close via Qualtrics UI controls. */
-  function isElementVisible(element) {
-    if (!element || !window.getComputedStyle) return false;
-    var style = window.getComputedStyle(element);
-    if (
-      style.display === 'none' ||
-      style.visibility === 'hidden' ||
-      style.opacity === '0'
-    ) {
-      return false;
+    function announce(message) {
+        var region = createLiveRegion();
+        region.textContent = '';
+        setTimeout(function () {
+            region.textContent = message;
+        }, 50);
     }
 
-    var rect = element.getBoundingClientRect();
-    return rect.width > 0 && rect.height > 0;
-  }
-
-  function isElementA11yVisible(element) {
-    return (
-      !!element &&
-      !element.closest('[aria-hidden="true"], [hidden], [inert]')
-    );
-  }
-
-  function isSurveyCurrentlyOpen() {
-    var surveyFrame = getSurveyFrame();
-    if (!surveyFrame) return false;
-
-    var panel = surveyFrame.closest(
-      '.QSIWebResponsiveDialog-Layout1-SI_Container, .QSIPopOver, .QSIContainer, #ZN_eaDVkKUnDpnwcei, #QSIFeedbackButton-target-container'
-    );
-
-    if (isElementVisible(surveyFrame) && (!panel || isElementVisible(panel))) {
-      return true;
+    function announceOpeningIfNeeded() {
+        if (openingAnnouncementSent || openAnnouncementSent) return;
+        announce('Opening feedback survey.');
+        openingAnnouncementSent = true;
     }
 
-    return false;
-  }
+    function resetAnnouncements() {
+        openAnnouncementSent = false;
+        openingAnnouncementSent = false;
+    }
 
-  function watchForManualOpen() {
-    document.addEventListener(
-      'click',
-      function (event) {
-        var launcher = event.target.closest('.QSIFeedbackButton button');
-        var launcherLink = event.target.closest('.QSIFeedbackButton a[href="#"]');
+    function getLauncherButton() {
+        return (
+            document.getElementById('QSIFeedbackButton-btn') ||
+            document.querySelector('.QSIFeedbackButton button')
+        );
+    }
 
-        if (launcherLink) {
-          /* Prevent hash navigation (jump to top) when VoiceOver activates
-             launcher markup wrapped in href="#" links on iOS Safari. */
-          event.preventDefault();
+    function getSurveyFrame() {
+        return (
+            document.getElementById('QSIFeedbackButton-survey-iframe') ||
+            document.querySelector('.QSIFeedbackButton iframe') ||
+            document.querySelector('#ZN_eaDVkKUnDpnwcei iframe')
+        );
+    }
+
+    function isElementVisible(element) {
+        if (!element || !window.getComputedStyle) return false;
+
+        var style = window.getComputedStyle(element);
+        if (
+            style.display === 'none' ||
+            style.visibility === 'hidden' ||
+            style.opacity === '0'
+        ) {
+            return false;
         }
 
-        if (launcher && !isSurveyOpen && !isAutoOpening) {
-          rememberFocusBeforeOpen();
-        }
-
-        if (launcher && !isAutoOpening && shouldConsumeTriggerOnManualOpen()) {
-          consumeAutoTrigger();
-        }
-      },
-      true
-    );
-
-    if (!window.MutationObserver) return;
-
-    surveyObserver = new MutationObserver(function () {
-      var surveyIsOpenNow = isSurveyCurrentlyOpen();
-
-      if (!isSurveyOpen && surveyIsOpenNow) {
-        isSurveyOpen = true;
-        markSurveyOpened();
-        debugLog('Survey marked open from observer.');
-      } else if (isSurveyOpen && !surveyIsOpenNow) {
-        if (Date.now() - lastSurveyOpenedAt < 1000) {
-          debugLog('Ignoring immediate post-open close signal.', {
-            msSinceOpen: Date.now() - lastSurveyOpenedAt,
-          });
-          return;
-        }
-
-        debugLog('Potential survey close detected; waiting to confirm.');
-        scheduleConfirmedCloseHandling();
-      }
-
-      if (
-        isAutoOpening ||
-        autoTriggerConsumed ||
-        !shouldConsumeTriggerOnManualOpen()
-      ) {
-        return;
-      }
-
-      if (getSurveyFrame()) {
-        consumeAutoTrigger();
-      }
-    });
-
-    surveyObserver.observe(document.body, {
-      childList: true,
-      subtree: true,
-      attributes: true,
-      attributeFilter: ['class', 'style', 'hidden', 'aria-hidden'],
-    });
-  }
-
-  function openButton() {
-    if (autoTriggerConsumed || isAutoOpening || isSurveyOpen) {
-      debugLog('Auto-open skipped.', {
-        autoTriggerConsumed: autoTriggerConsumed,
-        isAutoOpening: isAutoOpening,
-        isSurveyOpen: isSurveyOpen,
-      });
-      return;
+        var rect = element.getBoundingClientRect();
+        return rect.width > 0 && rect.height > 0;
     }
 
-    try {
-      var button = document.querySelector('.QSIFeedbackButton button');
-      if (!button) {
-        debugLog('Auto-open skipped: launcher button not found.');
-        return;
-      }
+    function isElementA11yVisible(element) {
+        return !!element && !element.closest('[aria-hidden="true"], [hidden], [inert]');
+    }
 
-      if (shouldConsumeTriggerOnAutoOpen()) {
-        consumeAutoTrigger();
-      }
-      isAutoOpening = true;
-      debugLog('Starting auto-open flow.');
-      rememberFocusBeforeOpen();
+    function isSurveyCurrentlyOpen() {
+        var frame = getSurveyFrame();
 
-      /* Pre-announce on desktop screen readers only. Skip on touch devices:
-        VoiceOver on iOS reads the survey when it opens, and any further DOM
-        mutation here can trigger Qualtrics' own observer on mobile. */
-      if (!isTouchDevice) {
-        announce('A short feedback survey is now available.');
-      }
-
-      /* A brief delay lets the aria-live announcement be read first.
-         Reduced for users who prefer less motion/animation. */
-      var openDelay = prefersReducedMotion ? 0 : 300;
-
-      setTimeout(function () {
-        if (isSurveyOpen || isSurveyCurrentlyOpen()) {
-          isAutoOpening = false;
-          markSurveyOpened();
-          debugLog('Skipping auto-open click: survey already open before click.');
-          return;
+        /* The Qualtrics container can exist while collapsed/hidden, which causes
+             false positives. Treat the survey as open only when its iframe is both
+             visible and not inside hidden/aria-hidden/inert ancestors. */
+        if (frame && isElementVisible(frame) && isElementA11yVisible(frame)) {
+            return true;
         }
 
-        /* On touch devices skip the programmatic click — Qualtrics handles
-           its own trigger on mobile and a scripted click may navigate away. */
-        if (!isTouchDevice) {
-          clickLauncherSafely(button);
+        return false;
+    }
+
+    function isValidRestoreTarget(element) {
+        if (!element || !document.contains(element)) return false;
+        if (element === document.body || element === document.documentElement) return false;
+        if (element.closest('#QSIFeedbackButton-target-container, .QSIFeedbackButton')) return false;
+        return true;
+    }
+
+    function getClosestRestorableElement(element) {
+        var current = element;
+        while (current && current !== document.body && current !== document.documentElement) {
+            if (isValidRestoreTarget(current)) return current;
+            current = current.parentElement;
         }
+        return null;
+    }
 
-        /* Poll for the survey iframe, then focus it. Qualtrics renders survey
-           content inside a cross-origin iframe; focusing the iframe element
-           itself is what moves VoiceOver's reading cursor into the panel.
-           We poll rather than use a fixed delay because the iframe may take
-           a variable amount of time to be injected into the DOM. */
-        var pollAttempts = 0;
-        var stableOpenPolls = 0;
-        var maxAttempts = prefersReducedMotion ? 8 : 40;
-        var pollInterval = prefersReducedMotion ? 50 : 100;
+    function findViewportRestoreTarget() {
+        var viewportH = window.innerHeight || document.documentElement.clientHeight;
+        var viewportMid = viewportH / 2;
+        var bestEl = null;
+        var bestDistance = Infinity;
 
-        var pollForFrame = setInterval(function () {
-          pollAttempts++;
+        /* Prefer headings and paragraphs inside <main> to avoid
+           sticky header or navigation links appearing first in DOM order. */
+        var scopeSelectors = [
+            'main h1, main h2, main h3, main h4, main h5, main h6, main p, main li',
+            '[role="main"] h1, [role="main"] h2, [role="main"] h3, [role="main"] p',
+            'h1, h2, h3, p',
+        ];
 
-          var surveyFrame = getSurveyFrame();
-          var surveyIsOpenNow = isSurveyCurrentlyOpen();
-          if (surveyIsOpenNow) {
-            stableOpenPolls++;
-          } else {
-            stableOpenPolls = 0;
-          }
+        for (var s = 0; s < scopeSelectors.length; s++) {
+            var candidates = document.querySelectorAll(scopeSelectors[s]);
+            bestEl = null;
+            bestDistance = Infinity;
 
-          if (stableOpenPolls >= 2 || pollAttempts >= maxAttempts) {
-            clearInterval(pollForFrame);
-            isAutoOpening = false;
-
-            if (stableOpenPolls >= 2 && surveyFrame) {
-              isSurveyOpen = true;
-              markSurveyOpened();
-              debugLog('Survey iframe detected and marked open.');
-              /* Ensure the iframe has a label so screen readers announce
-                 what it contains when focus enters it. */
-              if (!surveyFrame.getAttribute('title')) {
-                surveyFrame.setAttribute('title', 'Feedback survey');
-              }
-              /* tabindex="-1" lets us programmatically focus an iframe
-                 that doesn't already have a tabindex. */
-              if (!surveyFrame.hasAttribute('tabindex')) {
-                surveyFrame.setAttribute('tabindex', '-1');
-              }
-              if (isElementA11yVisible(surveyFrame)) {
-                surveyFrame.focus();
-              } else {
-                debugLog('Skipping iframe focus until it is accessibility-visible.');
-              }
-
-              announce('Feedback survey opened. Press Escape to close.');
-            } else {
-              /* Survey never reached a confirmed visible/open state. */
-              debugLog('Survey did not reach a confirmed open state before timeout.');
-              button.focus();
+            for (var i = 0; i < candidates.length; i++) {
+                var el = candidates[i];
+                if (!isValidRestoreTarget(el)) continue;
+                var rect = el.getBoundingClientRect();
+                if (rect.bottom < 0 || rect.top > viewportH) continue; /* not in viewport */
+                var elMid = rect.top + rect.height / 2;
+                var dist = Math.abs(elMid - viewportMid);
+                if (dist < bestDistance) {
+                    bestDistance = dist;
+                    bestEl = el;
+                }
             }
-          }
-        }, pollInterval);
 
-        /* Single, named Escape handler so it can be cleanly removed after
-           use — no risk of duplicate listeners or memory leaks. */
-        escapeHandler = function (e) {
-          if (e.key !== 'Escape') return;
-          e.preventDefault();
-          document.removeEventListener('keydown', escapeHandler);
-          escapeHandler = null;
-
-          clickLauncherSafely(button); /* Close the panel. */
-          isSurveyOpen = false;
-          lastSurveyOpenedAt = 0;
-          if (closeConfirmTimerId) {
-            clearTimeout(closeConfirmTimerId);
-            closeConfirmTimerId = null;
-          }
-          debugLog('Survey closed via Escape key.');
-          announce('Feedback survey closed.');
-          restoreFocusAfterClose();
-        };
-
-        document.addEventListener('keydown', escapeHandler);
-      }, openDelay);
-    } catch (e) {
-      /* Only emit errors in Qualtrics debug mode. */
-      window.QSI && QSI.dbg && QSI.dbg.e && QSI.dbg.e(e);
-    }
-  }
-
-  function addScrollHandler() {
-    if (!scrollHandlerAdded) {
-      /* passive:true tells the browser this handler never calls
-         preventDefault(), allowing it to optimise scroll performance. */
-      window.addEventListener('scroll', onScroll, { passive: true });
-      scrollHandlerAdded = true;
-    }
-  }
-
-  function addTimer() {
-    displayTimerId = setTimeout(function () {
-      displayTimerId = null;
-      openButton();
-    }, displayAfterThisManySeconds * 1000);
-  }
-
-  function onScroll() {
-    var now = new Date();
-    if (now - lastProcessedScrollEventTime > 100) {
-      lastProcessedScrollEventTime = now;
-      try {
-        var docHeight =
-          document.body.scrollHeight - document.documentElement.clientHeight;
-        if (docHeight <= 0) return;
-
-        var currentScrollPercentage = (window.scrollY / docHeight) * 100;
-
-        if (currentScrollPercentage >= displayAfterUserScrollsPastPercentOfPage) {
-          debugLog('Scroll threshold reached.', {
-            currentScrollPercentage: currentScrollPercentage,
-            threshold: displayAfterUserScrollsPastPercentOfPage,
-          });
-          openButton();
+            if (bestEl) {
+                return bestEl;
+            }
         }
-      } catch (e) {
-        window.QSI && QSI.dbg && QSI.dbg.e && QSI.dbg.e(e);
-      }
+
+        return null;
     }
-  }
+
+    function rememberCurrentFocus() {
+        var active = document.activeElement;
+        if (isValidRestoreTarget(active)) {
+            lastFocusBeforeSurveyOpen = active;
+            return;
+        }
+
+        if (isValidRestoreTarget(lastUserContextElement)) {
+            lastFocusBeforeSurveyOpen = lastUserContextElement;
+            return;
+        }
+
+        lastFocusBeforeSurveyOpen = findViewportRestoreTarget();
+    }
+
+    function restoreFocusAfterClose() {
+        var target = lastFocusBeforeSurveyOpen;
+        lastFocusBeforeSurveyOpen = null;
+
+        if (!isValidRestoreTarget(target)) {
+            return;
+        }
+
+        var restoreAnchor = null;
+        var cleanupDone = false;
+        var suppressedLauncherState = [];
+
+        function isLauncherElement(el) {
+            return !!(
+                el &&
+                (
+                    el.id === 'QSIFeedbackButton-btn' ||
+                    el.closest('#QSIFeedbackButton-target-container, .QSIFeedbackButton')
+                )
+            );
+        }
+
+        function createRestoreAnchor() {
+            if (!target.parentNode) return null;
+
+            var anchor = document.createElement('button');
+            anchor.type = 'button';
+            anchor.setAttribute('data-slideup-restore-anchor', 'true');
+            anchor.setAttribute('tabindex', '-1');
+            anchor.setAttribute('aria-label', 'Returned to the page content near where the feedback survey opened.');
+            anchor.textContent = 'Returned to the page content near where the feedback survey opened.';
+            anchor.style.cssText =
+                'position:absolute;width:1px;height:1px;overflow:hidden;' +
+                'clip:rect(0,0,0,0);white-space:nowrap;border:0;padding:0;margin:0;';
+
+            target.parentNode.insertBefore(anchor, target);
+            return anchor;
+        }
+
+        function suppressLauncherForRestore() {
+            var launcher = getLauncherButton();
+            var launcherWrapper = launcher && launcher.closest('.QSIFeedbackButton');
+            var elements = [launcherWrapper, launcher];
+
+            for (var i = 0; i < elements.length; i++) {
+                var el = elements[i];
+                if (!el || !document.contains(el)) continue;
+
+                suppressedLauncherState.push({
+                    element: el,
+                    ariaHidden: el.getAttribute('aria-hidden'),
+                    tabIndex: el.getAttribute('tabindex'),
+                    disabled: typeof el.disabled === 'boolean' ? el.disabled : null,
+                    inert: typeof el.inert === 'boolean' ? el.inert : null,
+                });
+
+                el.setAttribute('aria-hidden', 'true');
+                el.setAttribute('tabindex', '-1');
+                if (typeof el.disabled === 'boolean') {
+                    el.disabled = true;
+                }
+                if (typeof el.inert === 'boolean') {
+                    el.inert = true;
+                }
+            }
+        }
+
+        function restoreLauncherAfterRestore() {
+            for (var i = 0; i < suppressedLauncherState.length; i++) {
+                var state = suppressedLauncherState[i];
+                var el = state.element;
+                if (!el || !document.contains(el)) continue;
+
+                if (state.ariaHidden === null) {
+                    el.removeAttribute('aria-hidden');
+                } else {
+                    el.setAttribute('aria-hidden', state.ariaHidden);
+                }
+
+                if (state.tabIndex === null) {
+                    el.removeAttribute('tabindex');
+                } else {
+                    el.setAttribute('tabindex', state.tabIndex);
+                }
+
+                if (typeof el.disabled === 'boolean' && state.disabled !== null) {
+                    el.disabled = state.disabled;
+                }
+
+                if (typeof el.inert === 'boolean' && state.inert !== null) {
+                    el.inert = state.inert;
+                }
+            }
+
+            suppressedLauncherState = [];
+        }
+
+        function cleanupRestoreArtifacts() {
+            if (cleanupDone) return;
+            cleanupDone = true;
+
+            document.removeEventListener('focusin', guardHandler, true);
+            restoreLauncherAfterRestore();
+
+            if (restoreAnchor && document.contains(restoreAnchor) && document.activeElement !== restoreAnchor) {
+                restoreAnchor.remove();
+            }
+        }
+
+        function doRestore(reason) {
+            var focusTarget = restoreAnchor && document.contains(restoreAnchor) ? restoreAnchor : target;
+
+            if (!focusTarget || typeof focusTarget.focus !== 'function' || !document.contains(focusTarget)) {
+                return;
+            }
+
+            try {
+                focusTarget.focus({ preventScroll: true });
+            } catch (e) {
+                focusTarget.focus();
+            }
+        }
+
+        function guardHandler(event) {
+            if (isLauncherElement(event.target)) {
+                setTimeout(function () {
+                    doRestore('guard');
+                }, 0);
+            } else if (restoreAnchor && event.target !== restoreAnchor && document.contains(restoreAnchor)) {
+                restoreAnchor.remove();
+                restoreAnchor = null;
+            }
+        }
+
+        restoreAnchor = createRestoreAnchor();
+        suppressLauncherForRestore();
+        document.addEventListener('focusin', guardHandler, true);
+
+        setTimeout(function () {
+            cleanupRestoreArtifacts();
+        }, 2500);
+
+        setTimeout(function () {
+            doRestore('initial');
+        }, 400);
+    }
+
+    function stopAutoTriggers() {
+        if (displayTimerId) {
+            clearTimeout(displayTimerId);
+            displayTimerId = null;
+        }
+
+        if (scrollHandlerAdded) {
+            window.removeEventListener('scroll', onScroll, { passive: true });
+            scrollHandlerAdded = false;
+        }
+    }
+
+    function consumeAutoTrigger() {
+        if (autoTriggerConsumed) return;
+        autoTriggerConsumed = true;
+        stopAutoTriggers();
+    }
+
+    function openViaQsiApi() {
+        var api = window.QSI && window.QSI.API;
+        if (!api) {
+            return false;
+        }
+
+        try {
+            if (typeof api.load === 'function') {
+                api.load();
+            }
+        } catch (e) {
+            window.QSI && QSI.dbg && QSI.dbg.e && QSI.dbg.e(e);
+        }
+
+        try {
+            if (typeof api.run === 'function') {
+                api.run();
+                return true;
+            }
+        } catch (e2) {
+            window.QSI && QSI.dbg && QSI.dbg.e && QSI.dbg.e(e2);
+        }
+
+        return false;
+    }
+
+    function clickLauncherSafely(button) {
+        var cleanupHandlers = [];
+
+        var form = button.closest('form');
+        if (form) {
+            var preventSubmit = function (e) {
+                e.preventDefault();
+            };
+            form.addEventListener('submit', preventSubmit, true);
+            cleanupHandlers.push(function () {
+                form.removeEventListener('submit', preventSubmit, true);
+            });
+        }
+
+        var link = button.closest('a[href]');
+        if (link) {
+            var preventNav = function (e) {
+                e.preventDefault();
+            };
+            link.addEventListener('click', preventNav, true);
+            cleanupHandlers.push(function () {
+                link.removeEventListener('click', preventNav, true);
+            });
+        }
+
+        button.click();
+
+        setTimeout(function () {
+            for (var i = 0; i < cleanupHandlers.length; i++) {
+                cleanupHandlers[i]();
+            }
+        }, 0);
+    }
+
+    function requestSurveyOpen() {
+        var attemptedOpen = false;
+
+        if (openViaQsiApi()) {
+            attemptedOpen = true;
+        }
+
+        /* Some Qualtrics intercepts expose API methods but do not actually open
+             the feedback panel via run(). Fall back to launcher click unless the
+             survey is already visibly open. */
+        if (isSurveyCurrentlyOpen()) {
+            return true;
+        }
+
+        var button = getLauncherButton();
+        if (!button) {
+            return attemptedOpen;
+        }
+
+        clickLauncherSafely(button);
+        return true;
+    }
+
+    function focusAndAnnounceOpenIfReady() {
+        if (!isSurveyCurrentlyOpen()) return;
+
+        if (!openAnnouncementSent) {
+            announce('Feedback survey opened. Focus moved to the survey.');
+            openAnnouncementSent = true;
+        }
+
+        var frame = getSurveyFrame();
+        if (frame && isElementA11yVisible(frame)) {
+            if (!frame.getAttribute('title')) {
+                frame.setAttribute('title', 'Feedback survey');
+            }
+            if (!frame.hasAttribute('tabindex')) {
+                frame.setAttribute('tabindex', '-1');
+            }
+
+            /* Give VoiceOver a moment to speak the open announcement before
+                 focus shifts into the survey/close control. */
+            setTimeout(function () {
+                if (isSurveyCurrentlyOpen()) {
+                    frame.focus();
+                }
+            }, 500);
+        }
+    }
+
+    function waitForSurveyOpenAndFocus() {
+        var attempts = 0;
+        var maxAttempts = 40;
+        var stableOpenPolls = 0;
+        var pollId = setInterval(function () {
+            attempts++;
+
+            var openNow = isSurveyCurrentlyOpen();
+
+            /* Qualtrics assets can initialize after the 20% threshold is hit.
+                 Retry a few times so late button/API availability still opens. */
+            if (!openNow && attempts <= 20 && attempts % 3 === 1) {
+                requestSurveyOpen();
+            }
+
+            if (openNow) {
+                stableOpenPolls++;
+            } else {
+                stableOpenPolls = 0;
+            }
+
+            if (stableOpenPolls >= 2 || attempts >= maxAttempts) {
+                clearInterval(pollId);
+                isAutoOpening = false;
+
+                if (stableOpenPolls >= 2) {
+                    isSurveyOpen = true;
+                    consumeAutoTrigger();
+                    focusAndAnnounceOpenIfReady();
+                }
+            }
+        }, 100);
+    }
+
+    function openSurveyAutomatically() {
+        if (autoTriggerConsumed || isAutoOpening || isSurveyOpen) {
+            return;
+        }
+
+        if (isSurveyCurrentlyOpen()) {
+            isSurveyOpen = true;
+            consumeAutoTrigger();
+            focusAndAnnounceOpenIfReady();
+            return;
+        }
+
+        isAutoOpening = true;
+        rememberCurrentFocus();
+        announceOpeningIfNeeded();
+
+        setTimeout(function () {
+            if (isSurveyCurrentlyOpen()) {
+                isSurveyOpen = true;
+                isAutoOpening = false;
+                focusAndAnnounceOpenIfReady();
+                return;
+            }
+
+            requestSurveyOpen();
+            waitForSurveyOpenAndFocus();
+        }, 300);
+    }
+
+    function addScrollHandler() {
+        if (scrollHandlerAdded) return;
+        window.addEventListener('scroll', onScroll, { passive: true });
+        scrollHandlerAdded = true;
+    }
+
+    function addTimer() {
+        displayTimerId = setTimeout(function () {
+            displayTimerId = null;
+            openSurveyAutomatically();
+        }, displayAfterThisManySeconds * 1000);
+    }
+
+    function onScroll() {
+        var now = Date.now();
+        if (now - lastProcessedScrollEventTime < scrollThrottleMs) return;
+        lastProcessedScrollEventTime = now;
+
+        try {
+            var docHeight = document.body.scrollHeight - document.documentElement.clientHeight;
+            if (docHeight <= 0) return;
+
+            var currentScrollPercentage = (window.scrollY / docHeight) * 100;
+            if (currentScrollPercentage >= displayAfterUserScrollsPastPercentOfPage) {
+                openSurveyAutomatically();
+            }
+        } catch (e) {
+            window.QSI && QSI.dbg && QSI.dbg.e && QSI.dbg.e(e);
+        }
+    }
+
+    function rememberUserContext(event) {
+        var candidate = getClosestRestorableElement(event.target);
+        if (candidate) {
+            lastUserContextElement = candidate;
+        }
+    }
+
+    function watchForManualOpenAndStateChanges() {
+        document.addEventListener('focusin', rememberUserContext, true);
+        document.addEventListener('click', rememberUserContext, true);
+        document.addEventListener('touchstart', rememberUserContext, true);
+
+        document.addEventListener(
+            'click',
+            function (event) {
+                var launcher = event.target.closest('#QSIFeedbackButton-btn, .QSIFeedbackButton button');
+                if (!launcher) return;
+
+                if (!isSurveyOpen && !isAutoOpening) {
+                    rememberCurrentFocus();
+                }
+
+                if (!isAutoOpening) {
+                    consumeAutoTrigger();
+                }
+            },
+            true
+        );
+
+        if (!window.MutationObserver) return;
+
+        var observer = new MutationObserver(function () {
+            var openNow = isSurveyCurrentlyOpen();
+
+            if (!isSurveyOpen && openNow) {
+                isSurveyOpen = true;
+                focusAndAnnounceOpenIfReady();
+            } else if (isSurveyOpen && !openNow) {
+                isSurveyOpen = false;
+                resetAnnouncements();
+                restoreFocusAfterClose();
+            }
+        });
+
+        observer.observe(document.body, {
+            childList: true,
+            subtree: true,
+            attributes: true,
+            attributeFilter: ['class', 'style', 'hidden', 'aria-hidden'],
+        });
+    }
+
 })();
